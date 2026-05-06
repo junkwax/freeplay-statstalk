@@ -101,7 +101,19 @@ echo ""
 # ── 3. Grant secret access ─────────────────────────────────────────────────────
 echo "[3/6] Granting secret access..."
 
-for SECRET in STATS_API_KEY DISCORD_WEBHOOK_URL; do
+# JWT_SECRET is shared with the signaling server — stats verifies client-issued
+# JWTs locally for ghost upload (rather than round-tripping through signaling).
+# We expect signaling's deploy to have created the secret first; if missing,
+# warn but don't fail — stats just returns 503 on JWT-protected endpoints.
+SECRETS_TO_BIND=(STATS_API_KEY DISCORD_WEBHOOK_URL)
+if gcloud secrets describe JWT_SECRET --project="${PROJECT_ID}" &>/dev/null; then
+  SECRETS_TO_BIND+=(JWT_SECRET)
+else
+  echo "  ⚠ JWT_SECRET not in Secret Manager — ghost upload will return 503"
+  echo "    Run signaling-server deploy.sh first (it creates the JWT_SECRET secret)."
+fi
+
+for SECRET in "${SECRETS_TO_BIND[@]}"; do
   gcloud secrets add-iam-policy-binding "${SECRET}" \
     --member="serviceAccount:${COMPUTE_SA}" \
     --role="roles/secretmanager.secretAccessor" \
@@ -146,6 +158,13 @@ echo "[6/6] Deploying to Cloud Run..."
 
 SECRETS_LIST="STATS_API_KEY=STATS_API_KEY:latest"
 SECRETS_LIST="${SECRETS_LIST},DISCORD_WEBHOOK_URL=DISCORD_WEBHOOK_URL:latest"
+
+# Conditionally include JWT_SECRET (shared with signaling). Without this,
+# ghost-upload returns 503 — that's the intended degrade path so a stats
+# deploy without signaling running first still serves leaderboards.
+if gcloud secrets describe JWT_SECRET --project="${PROJECT_ID}" &>/dev/null; then
+  SECRETS_LIST="${SECRETS_LIST},JWT_SECRET=JWT_SECRET:latest"
+fi
 
 gcloud run deploy "${SERVICE_NAME}" \
   --image="${IMAGE}" \
