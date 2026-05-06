@@ -1,0 +1,18 @@
+/target
+.env
+*.db
+*.db-shm
+*.db-wal
+
+# Claude Code project-local state — user-specific, should not be shared
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
