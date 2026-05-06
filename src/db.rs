@@ -17,6 +17,9 @@ impl Db {
 
     fn migrate(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // Step 1: create base tables (no applied_at-dependent index yet).
+        // CREATE IF NOT EXISTS is the legacy-safe form; an existing
+        // production DB will not be re-created here.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS players (
                 discord_id TEXT PRIMARY KEY,
@@ -39,20 +42,12 @@ impl Db {
                 loser_score   INTEGER NOT NULL,
                 rom_hash      TEXT NOT NULL DEFAULT '',
                 played_at     TEXT NOT NULL,
-                -- Rating-period close timestamp at which this match's
-                -- ratings were applied. NULL = still pending. The periodic
-                -- closer aggregates rows with NULL into a Glicko-2 batch.
                 applied_at    TEXT
             );
 
-            -- Add applied_at to legacy DBs that pre-date the periodized
-            -- Glicko-2 work. Idempotent: SQLite errors if the column already
-            -- exists, which we swallow because process_result only ever
-            -- inserts NULL after this migration.
             CREATE INDEX IF NOT EXISTS idx_matches_winner ON matches(winner_id);
             CREATE INDEX IF NOT EXISTS idx_matches_loser  ON matches(loser_id);
-            CREATE INDEX IF NOT EXISTS idx_matches_played  ON matches(played_at);
-            CREATE INDEX IF NOT EXISTS idx_matches_applied ON matches(applied_at);
+            CREATE INDEX IF NOT EXISTS idx_matches_played ON matches(played_at);
 
             CREATE TABLE IF NOT EXISTS rating_periods (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,10 +72,22 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_ghosts_upload ON ghosts(uploaded_at DESC);
             ",
         )?;
-        // Legacy DBs predating the periodized Glicko-2 work won't have the
-        // applied_at column. Add it if missing. SQLite will error if it
-        // already exists; we treat that as success.
+
+        // Step 2: legacy DBs that pre-date the periodized Glicko-2 work
+        // already have a `matches` table without applied_at. Add the column
+        // if missing. SQLite errors if it already exists — that's our signal
+        // it's fresh and we move on.
         let _ = conn.execute("ALTER TABLE matches ADD COLUMN applied_at TEXT", []);
+
+        // Step 3: now the column is guaranteed present; create the dependent
+        // index. Doing this AFTER the ALTER avoids the bootstrap order bug
+        // where execute_batch sees a CREATE INDEX referencing a column the
+        // legacy schema doesn't have yet.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_matches_applied ON matches(applied_at)",
+            [],
+        )?;
+
         Ok(())
     }
 
