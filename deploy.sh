@@ -166,6 +166,36 @@ if gcloud secrets describe JWT_SECRET --project="${PROJECT_ID}" &>/dev/null; the
   SECRETS_LIST="${SECRETS_LIST},JWT_SECRET=JWT_SECRET:latest"
 fi
 
+# Use a YAML env-vars file rather than an inline --set-env-vars="DB_PATH=/db/...".
+# Reason: when running deploy.sh from MSYS/Git-Bash on Windows, the inline form
+# is mangled — bash translates `/db/stats.db` to `C:/Program Files/Git/db/stats.db`
+# before it reaches gcloud, breaking SQLite startup. The YAML file dodges path
+# translation entirely.
+ENV_VARS_FILE="$(mktemp -t stats-env-XXXX.yaml)"
+trap 'rm -f "${ENV_VARS_FILE}"' EXIT
+cat > "${ENV_VARS_FILE}" <<'EOF'
+DB_PATH: /db/stats.db
+EOF
+
+# `--add-volume`/`--add-volume-mount` are *additive* — running this on a
+# service that already has the volume errors with "should be a valid unix
+# absolute path" because Cloud Run sees a duplicate mount entry. Only
+# attach the volume on the very first deploy.
+EXISTING_MOUNT=$(gcloud run services describe "${SERVICE_NAME}" \
+  --region="${REGION}" --project="${PROJECT_ID}" \
+  --format='value(spec.template.spec.containers[0].volumeMounts[0].name)' 2>/dev/null || echo "")
+
+VOLUME_ARGS=()
+if [ -z "${EXISTING_MOUNT}" ]; then
+  echo "  ✓ First deploy — attaching gcs-fuse volume"
+  VOLUME_ARGS+=(
+    --add-volume="name=stats-db,type=cloud-storage,bucket=${BUCKET_NAME}"
+    --add-volume-mount="volume=stats-db,mount-path=/db"
+  )
+else
+  echo "  ✓ Volume already attached: ${EXISTING_MOUNT}"
+fi
+
 gcloud run deploy "${SERVICE_NAME}" \
   --image="${IMAGE}" \
   --platform=managed \
@@ -177,9 +207,8 @@ gcloud run deploy "${SERVICE_NAME}" \
   --memory=512Mi \
   --cpu=1 \
   --set-secrets="${SECRETS_LIST}" \
-  --set-env-vars="DB_PATH=/db/stats.db" \
-  --add-volume=name=stats-db,type=cloud-storage,bucket="${BUCKET_NAME}" \
-  --add-volume-mount=volume=stats-db,mount-path=/db
+  --env-vars-file="${ENV_VARS_FILE}" \
+  "${VOLUME_ARGS[@]}"
 
 SERVICE_URL=$(gcloud run services describe "${SERVICE_NAME}" \
   --region="${REGION}" \
