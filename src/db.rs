@@ -39,9 +39,9 @@ impl Db {
                 loser_score   INTEGER NOT NULL,
                 rom_hash      TEXT NOT NULL DEFAULT '',
                 played_at     TEXT NOT NULL,
-                /// Rating-period close timestamp at which this match's
-                /// ratings were applied. NULL = still pending. The periodic
-                /// closer aggregates rows with NULL into a Glicko-2 batch.
+                -- Rating-period close timestamp at which this match's
+                -- ratings were applied. NULL = still pending. The periodic
+                -- closer aggregates rows with NULL into a Glicko-2 batch.
                 applied_at    TEXT
             );
 
