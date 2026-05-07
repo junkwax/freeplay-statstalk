@@ -289,6 +289,11 @@ impl Db {
         Ok(rows.next().transpose()?)
     }
 
+    pub fn get_rating(&self, discord_id: &str) -> anyhow::Result<Rating> {
+        let conn = self.conn.lock().unwrap();
+        read_rating(&conn, discord_id)
+    }
+
     pub fn get_leaderboard(&self, limit: u32) -> anyhow::Result<Vec<crate::models::LeaderboardEntry>> {
         // Require N placement matches before appearing publicly. Standard
         // ranked-ladder hygiene: a single lucky win against a 1500-rated

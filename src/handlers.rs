@@ -50,7 +50,7 @@ pub async fn post_result(
         &result.room_id,
         &result.rom_hash,
     ) {
-        Ok((winner_rating, loser_rating)) => {
+        Ok((_winner_rating, _loser_rating)) => {
             // Update usernames so leaderboard/history shows readable names.
             if !result.winner_username.is_empty() {
                 let _ = state.db.update_username(&result.winner_id, &result.winner_username);
@@ -58,6 +58,16 @@ pub async fn post_result(
             if !result.loser_username.is_empty() {
                 let _ = state.db.update_username(&result.loser_id, &result.loser_username);
             }
+
+            // Apply accepted ranked results immediately so Discord summaries
+            // and the leaderboard move after a completed match. The hourly
+            // closer still exists as a fallback for inactivity/RD cleanup and
+            // rows left pending after a restart.
+            if let Err(e) = state.db.close_rating_period() {
+                tracing::error!("Failed to close rating period after result: {e}");
+            }
+            let winner_rating = state.db.get_rating(&result.winner_id).unwrap_or_default();
+            let loser_rating = state.db.get_rating(&result.loser_id).unwrap_or_default();
 
             // Resolve display names: request username > stored username > discord_id.
             let winner_display = if !result.winner_username.is_empty() {
