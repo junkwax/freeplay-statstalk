@@ -89,4 +89,71 @@ pub struct GhostListQuery {
     pub limit: u32,
 }
 
-fn default_ghost_limit() -> u32 { 50 }
+fn default_ghost_limit() -> u32 {
+    50
+}
+
+// ── Full match replay storage ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayEntry {
+    pub replay_id: String,
+    pub discord_id: String,
+    pub username: String,
+    pub rom_hash: String,
+    #[serde(rename = "file")]
+    pub filename: String,
+    pub url: String,
+    #[serde(rename = "p1")]
+    pub p1_name: String,
+    #[serde(rename = "p2")]
+    pub p2_name: String,
+    pub p1_score: Option<u16>,
+    pub p2_score: Option<u16>,
+    pub winner: String,
+    #[serde(rename = "frames")]
+    pub frame_count: u32,
+    pub duration: String,
+    pub recorded_at: String,
+    pub session_id: String,
+    pub completed_games: u32,
+    pub completed_set: bool,
+    pub uploaded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayListResponse {
+    pub replays: Vec<ReplayEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplayListQuery {
+    #[serde(default)]
+    pub rom_hash: String,
+    #[serde(default = "default_replay_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayMetaInsert {
+    pub replay_id: String,
+    pub discord_id: String,
+    pub username: String,
+    pub rom_hash: String,
+    pub filename: String,
+    pub p1_name: String,
+    pub p2_name: String,
+    pub p1_score: Option<u16>,
+    pub p2_score: Option<u16>,
+    pub winner: String,
+    pub frame_count: u32,
+    pub duration: String,
+    pub recorded_at: String,
+    pub session_id: String,
+    pub completed_games: u32,
+    pub completed_set: bool,
+}
+
+fn default_replay_limit() -> u32 {
+    50
+}

@@ -26,7 +26,9 @@ impl Discord {
         loser_rating: f64,
     ) {
         let Some(url) = &self.webhook_url else { return };
-        if url.is_empty() { return; }
+        if url.is_empty() {
+            return;
+        }
 
         let msg = format!(
             ":trophy: **{winner_name}** ({winner_score}) beats **{loser_name}** ({loser_score})\n\
@@ -37,7 +39,8 @@ impl Discord {
         let url = url.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
-            let _ = client.post(&url)
+            let _ = client
+                .post(&url)
                 .json(&serde_json::json!({ "content": msg }))
                 .send()
                 .await;

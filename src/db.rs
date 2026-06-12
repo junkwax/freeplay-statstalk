@@ -1,6 +1,6 @@
-use rusqlite::{Connection, params};
-use std::sync::Mutex;
 use crate::glicko::{self, PeriodResult, Rating};
+use rusqlite::{params, Connection};
+use std::sync::Mutex;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -10,7 +10,9 @@ impl Db {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -70,6 +72,30 @@ impl Db {
 
             CREATE INDEX IF NOT EXISTS idx_ghosts_rom    ON ghosts(rom_hash);
             CREATE INDEX IF NOT EXISTS idx_ghosts_upload ON ghosts(uploaded_at DESC);
+
+            CREATE TABLE IF NOT EXISTS replays (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                replay_id       TEXT NOT NULL UNIQUE,
+                discord_id      TEXT NOT NULL,
+                username        TEXT NOT NULL DEFAULT '',
+                rom_hash        TEXT NOT NULL DEFAULT '',
+                filename        TEXT NOT NULL,
+                p1_name         TEXT NOT NULL DEFAULT '',
+                p2_name         TEXT NOT NULL DEFAULT '',
+                p1_score        INTEGER,
+                p2_score        INTEGER,
+                winner          TEXT NOT NULL DEFAULT '',
+                frame_count     INTEGER NOT NULL DEFAULT 0,
+                duration        TEXT NOT NULL DEFAULT '',
+                recorded_at     TEXT NOT NULL DEFAULT '',
+                session_id      TEXT NOT NULL DEFAULT '',
+                completed_games INTEGER NOT NULL DEFAULT 0,
+                completed_set   INTEGER NOT NULL DEFAULT 0,
+                uploaded_at     TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_replays_rom    ON replays(rom_hash);
+            CREATE INDEX IF NOT EXISTS idx_replays_upload ON replays(uploaded_at DESC);
             ",
         )?;
 
@@ -169,16 +195,14 @@ impl Db {
         // Snapshot every player's pre-period rating once. We need a
         // consistent view because each player's results in this period
         // reference opponents' pre-period ratings, not running ones.
-        let mut stmt = conn.prepare(
-            "SELECT discord_id, mu, phi, sigma FROM players"
-        )?;
+        let mut stmt = conn.prepare("SELECT discord_id, mu, phi, sigma FROM players")?;
         let pre_period: std::collections::HashMap<String, Rating> = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     Rating {
-                        mu:    r.get(1)?,
-                        phi:   r.get(2)?,
+                        mu: r.get(1)?,
+                        phi: r.get(2)?,
                         sigma: r.get(3)?,
                     },
                 ))
@@ -189,7 +213,7 @@ impl Db {
         // Pull all pending matches once.
         let mut stmt = conn.prepare(
             "SELECT id, winner_id, loser_id, winner_score, loser_score
-             FROM matches WHERE applied_at IS NULL"
+             FROM matches WHERE applied_at IS NULL",
         )?;
         let pending: Vec<(i64, String, String, u16, u16)> = stmt
             .query_map([], |r| {
@@ -203,17 +227,23 @@ impl Db {
             std::collections::HashMap::new();
         for (_id, winner_id, loser_id, _ws, _ls) in &pending {
             let winner_pre = pre_period.get(winner_id).cloned().unwrap_or_default();
-            let loser_pre  = pre_period.get(loser_id).cloned().unwrap_or_default();
-            by_player.entry(winner_id.clone()).or_default().push(PeriodResult {
-                opponent_mu:  loser_pre.mu,
-                opponent_phi: loser_pre.phi,
-                score: 1.0,
-            });
-            by_player.entry(loser_id.clone()).or_default().push(PeriodResult {
-                opponent_mu:  winner_pre.mu,
-                opponent_phi: winner_pre.phi,
-                score: 0.0,
-            });
+            let loser_pre = pre_period.get(loser_id).cloned().unwrap_or_default();
+            by_player
+                .entry(winner_id.clone())
+                .or_default()
+                .push(PeriodResult {
+                    opponent_mu: loser_pre.mu,
+                    opponent_phi: loser_pre.phi,
+                    score: 1.0,
+                });
+            by_player
+                .entry(loser_id.clone())
+                .or_default()
+                .push(PeriodResult {
+                    opponent_mu: winner_pre.mu,
+                    opponent_phi: winner_pre.phi,
+                    score: 0.0,
+                });
         }
 
         // Apply Glicko-2 to active players, RD-inflate inactives.
@@ -265,7 +295,10 @@ impl Db {
         Ok((pending.len(), updated_count))
     }
 
-    pub fn get_player(&self, discord_id: &str) -> anyhow::Result<Option<crate::models::PlayerProfile>> {
+    pub fn get_player(
+        &self,
+        discord_id: &str,
+    ) -> anyhow::Result<Option<crate::models::PlayerProfile>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT discord_id, username, mu, phi, sigma, wins, losses, draws FROM players WHERE discord_id = ?1"
@@ -294,81 +327,97 @@ impl Db {
         read_rating(&conn, discord_id)
     }
 
-    pub fn get_leaderboard(&self, limit: u32) -> anyhow::Result<Vec<crate::models::LeaderboardEntry>> {
-        // Require N placement matches before appearing publicly. Standard
-        // ranked-ladder hygiene: a single lucky win against a 1500-rated
-        // opponent would otherwise put a player on top with provisional
-        // rating + huge RD, which is misleading on a community board.
-        const MIN_PLACEMENT_MATCHES: u32 = 5;
+    pub fn get_leaderboard(
+        &self,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::models::LeaderboardEntry>> {
+        // Show players as soon as they have a recorded result. Guest players
+        // without a stats email still have a stable guest-device identity, so
+        // hiding them behind a placement gate makes their rank look broken.
+        const MIN_PLACEMENT_MATCHES: u32 = 1;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT discord_id, username, mu, wins, losses, draws
              FROM players
              WHERE wins + losses + draws >= ?1
              ORDER BY mu DESC
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
-        let entries = stmt.query_map(params![MIN_PLACEMENT_MATCHES, limit], |r| {
-            let wins: u64 = r.get(3)?;
-            let losses: u64 = r.get(4)?;
-            let draws: u64 = r.get(5)?;
-            Ok(crate::models::LeaderboardEntry {
-                rank: 0, // filled in later
-                discord_id: r.get(0)?,
-                username: r.get(1)?,
-                rating: r.get(2)?,
-                wins,
-                losses,
-                matches_played: wins + losses + draws,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let entries = stmt
+            .query_map(params![MIN_PLACEMENT_MATCHES, limit], |r| {
+                let wins: u64 = r.get(3)?;
+                let losses: u64 = r.get(4)?;
+                let draws: u64 = r.get(5)?;
+                Ok(crate::models::LeaderboardEntry {
+                    rank: 0, // filled in later
+                    discord_id: r.get(0)?,
+                    username: r.get(1)?,
+                    rating: r.get(2)?,
+                    wins,
+                    losses,
+                    matches_played: wins + losses + draws,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let ranked: Vec<_> = entries.into_iter().enumerate().map(|(i, mut e)| {
-            e.rank = (i + 1) as u64;
-            e
-        }).collect();
+        let ranked: Vec<_> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut e)| {
+                e.rank = (i + 1) as u64;
+                e
+            })
+            .collect();
         Ok(ranked)
     }
 
-    pub fn get_match_history(&self, discord_id: &str, limit: u32) -> anyhow::Result<Vec<crate::models::MatchHistoryEntry>> {
+    pub fn get_match_history(
+        &self,
+        discord_id: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::models::MatchHistoryEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT room_id, winner_id, loser_id, winner_score, loser_score, played_at
              FROM matches
              WHERE winner_id = ?1 OR loser_id = ?1
              ORDER BY played_at DESC
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
-        let entries = stmt.query_map(params![discord_id, limit], |r| {
-            let winner: String = r.get(1)?;
-            let loser: String = r.get(2)?;
-            let w_score: u16 = r.get(3)?;
-            let l_score: u16 = r.get(4)?;
-            let played: String = r.get(5)?;
+        let entries = stmt
+            .query_map(params![discord_id, limit], |r| {
+                let winner: String = r.get(1)?;
+                let loser: String = r.get(2)?;
+                let w_score: u16 = r.get(3)?;
+                let l_score: u16 = r.get(4)?;
+                let played: String = r.get(5)?;
 
-            let (result, our_score, opp_score, opp_id) = if winner == discord_id {
-                ("win".to_string(), w_score, l_score, loser.clone())
-            } else {
-                ("loss".to_string(), l_score, w_score, winner.clone())
-            };
+                let (result, our_score, opp_score, opp_id) = if winner == discord_id {
+                    ("win".to_string(), w_score, l_score, loser.clone())
+                } else {
+                    ("loss".to_string(), l_score, w_score, winner.clone())
+                };
 
-            // Look up opponent username.
-            let opp_username = conn.query_row(
-                "SELECT username FROM players WHERE discord_id = ?1",
-                params![opp_id],
-                |r| r.get(0),
-            ).unwrap_or_default();
+                // Look up opponent username.
+                let opp_username = conn
+                    .query_row(
+                        "SELECT username FROM players WHERE discord_id = ?1",
+                        params![opp_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
 
-            Ok(crate::models::MatchHistoryEntry {
-                room_id: r.get(0)?,
-                opponent_id: opp_id,
-                opponent_username: opp_username,
-                result,
-                our_score,
-                opponent_score: opp_score,
-                played_at: played,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+                Ok(crate::models::MatchHistoryEntry {
+                    room_id: r.get(0)?,
+                    opponent_id: opp_id,
+                    opponent_username: opp_username,
+                    result,
+                    our_score,
+                    opponent_score: opp_score,
+                    played_at: played,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(entries)
     }
@@ -379,7 +428,9 @@ impl Db {
             "SELECT username FROM players WHERE discord_id = ?1",
             params![discord_id],
             |r| r.get(0),
-        ).ok().filter(|s: &String| !s.is_empty())
+        )
+        .ok()
+        .filter(|s: &String| !s.is_empty())
     }
 
     pub fn update_username(&self, discord_id: &str, username: &str) -> anyhow::Result<()> {
@@ -421,11 +472,13 @@ impl Db {
     /// `ghosts/<ghost_id>.ncgh.gz`), then falls back to the SQLite BLOB
     /// (old base64-encoded uploads). Returns the raw bytes (still gzip'd
     /// for new uploads, raw .ncgh for old).
-    pub fn download_ghost(&self, ghost_id: &str) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
+    pub fn download_ghost(
+        &self,
+        ghost_id: &str,
+    ) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT filename, file_data FROM ghosts WHERE ghost_id = ?1"
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT filename, file_data FROM ghosts WHERE ghost_id = ?1")?;
         let mut rows = stmt.query_map(params![ghost_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
@@ -444,11 +497,16 @@ impl Db {
         }
     }
 
-    pub fn list_ghosts(&self, rom_hash: &str, limit: u32) -> anyhow::Result<Vec<crate::models::GhostEntry>> {
+    pub fn list_ghosts(
+        &self,
+        rom_hash: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::models::GhostEntry>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.min(100).max(1) as i64;
 
-        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if rom_hash.is_empty() {
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if rom_hash.is_empty()
+        {
             ("SELECT ghost_id, discord_id, username, rom_hash, filename, frame_count, uploaded_at
               FROM ghosts ORDER BY uploaded_at DESC LIMIT ?1",
              vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>])
@@ -458,7 +516,8 @@ impl Db {
              vec![Box::new(rom_hash.to_string()), Box::new(limit)])
         };
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
             Ok(crate::models::GhostEntry {
@@ -474,12 +533,127 @@ impl Db {
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    // ── Full match replay operations ───────────────────────────────────────
+
+    /// Store replay metadata in SQLite. The actual compressed .ncrp file is
+    /// written to `replays/<replay_id>.ncrp.gz` on the GCS-FUSE mount by the
+    /// handler.
+    pub fn upload_replay_meta(
+        &self,
+        replay: &crate::models::ReplayMetaInsert,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO replays
+             (replay_id, discord_id, username, rom_hash, filename, p1_name, p2_name,
+              p1_score, p2_score, winner, frame_count, duration, recorded_at, session_id,
+              completed_games, completed_set, uploaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, datetime('now'))",
+            params![
+                &replay.replay_id,
+                &replay.discord_id,
+                &replay.username,
+                &replay.rom_hash,
+                &replay.filename,
+                &replay.p1_name,
+                &replay.p2_name,
+                replay.p1_score,
+                replay.p2_score,
+                &replay.winner,
+                replay.frame_count,
+                &replay.duration,
+                &replay.recorded_at,
+                &replay.session_id,
+                replay.completed_games,
+                if replay.completed_set { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn replay_filename(&self, replay_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let filename = conn.query_row(
+            "SELECT filename FROM replays WHERE replay_id = ?1",
+            params![replay_id],
+            |row| row.get(0),
+        );
+        match filename {
+            Ok(filename) => Ok(Some(filename)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_replays(
+        &self,
+        rom_hash: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::models::ReplayEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.min(100).max(1) as i64;
+
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if rom_hash.is_empty()
+        {
+            (
+                "SELECT replay_id, discord_id, username, rom_hash, filename, p1_name, p2_name,
+                     p1_score, p2_score, winner, frame_count, duration, recorded_at,
+                     session_id, completed_games, completed_set, uploaded_at
+              FROM replays ORDER BY uploaded_at DESC LIMIT ?1",
+                vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
+            )
+        } else {
+            (
+                "SELECT replay_id, discord_id, username, rom_hash, filename, p1_name, p2_name,
+                     p1_score, p2_score, winner, frame_count, duration, recorded_at,
+                     session_id, completed_games, completed_set, uploaded_at
+              FROM replays WHERE rom_hash = ?1 ORDER BY uploaded_at DESC LIMIT ?2",
+                vec![Box::new(rom_hash.to_string()), Box::new(limit)],
+            )
+        };
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            let completed_set: i64 = row.get(15)?;
+            Ok(crate::models::ReplayEntry {
+                replay_id: row.get(0)?,
+                discord_id: row.get(1)?,
+                username: row.get(2)?,
+                rom_hash: row.get(3)?,
+                filename: row.get(4)?,
+                url: String::new(),
+                p1_name: row.get(5)?,
+                p2_name: row.get(6)?,
+                p1_score: row.get(7)?,
+                p2_score: row.get(8)?,
+                winner: row.get(9)?,
+                frame_count: row.get(10)?,
+                duration: row.get(11)?,
+                recorded_at: row.get(12)?,
+                session_id: row.get(13)?,
+                completed_games: row.get(14)?,
+                completed_set: completed_set != 0,
+                uploaded_at: row.get(16)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 fn read_rating(conn: &Connection, discord_id: &str) -> anyhow::Result<Rating> {
     Ok(conn.query_row(
         "SELECT mu, phi, sigma FROM players WHERE discord_id = ?1",
         params![discord_id],
-        |r| Ok(Rating { mu: r.get(0)?, phi: r.get(1)?, sigma: r.get(2)? }),
+        |r| {
+            Ok(Rating {
+                mu: r.get(0)?,
+                phi: r.get(1)?,
+                sigma: r.get(2)?,
+            })
+        },
     )?)
 }

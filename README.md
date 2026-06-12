@@ -1,9 +1,9 @@
 # freeplay-stats
 
-Match history, Glicko-2 ratings, and ghost-replay storage for Freeplay.
+Match history, Glicko-2 ratings, drone storage, and match replay storage for Freeplay.
 A small Rust/Axum service that the signaling server calls when a match
 ends, plus public read endpoints for leaderboards and a public
-upload/download API for ghost files.
+upload/download API for community replay files.
 
 ## What it does
 
@@ -17,9 +17,11 @@ to `/results`. This service:
 4. Increments W/L counters.
 5. Posts a summary to Discord via webhook (fire-and-forget).
 
-It also stores **ghost files** — `.ncgh` replays uploaded by the Freeplay
-client — keyed by ROM hash so other players can list and download them
-for solo playback.
+It also stores community replay files:
+
+- **Drone files** (`.ncgh`) for solo playback against a recorded opponent.
+- **Full match replays** (`.ncrp`) for Fightcade-style review of completed
+  online games.
 
 ## Endpoints
 
@@ -49,14 +51,23 @@ for solo playback.
 - `GET /player/:discord_id/history?limit=50` — recent matches with
   win/loss flag and opponent info. Limit clamped to `[1, 100]`.
 
-### Ghost replays (public, no auth)
-- `POST /ghosts/upload` — body has `ghost_id`, `discord_id`, `username`,
-  `rom_hash`, `filename`, `file_base64`, `frame_count`. INSERT OR REPLACE
-  on `ghost_id`.
+### Drone replays
+- `POST /ghosts/upload` — authenticated binary upload. Body is gzip-compressed
+  `.ncgh`; metadata is carried in `X-Freeplay-*` headers.
 - `GET /ghosts/list?rom_hash=<hash>&limit=50` — list ghosts, optionally
   filtered by ROM. Most recent first.
 - `GET /ghosts/download/:ghost_id` — raw bytes,
   `Content-Type: application/octet-stream`. 404 if unknown.
+
+### Full match replays
+- `POST /replays/upload` — authenticated binary upload. Body is gzip-compressed
+  `.ncrp`; metadata is carried in `X-Freeplay-*` headers including player
+  names, score, winner, frame count, duration, session id, and set completion.
+- `GET /replays/list?rom_hash=<hash>&limit=50` — returns
+  `{ "replays": [...] }` with `file`, `url`, `p1`, `p2`, `p1_score`,
+  `p2_score`, `winner`, `frames`, `duration`, and upload metadata.
+- `GET /replays/download/:replay_id` — gzip-compressed `.ncrp` bytes with
+  `Content-Encoding: gzip`. No auth; community replays are public.
 
 ## Storage
 
@@ -70,6 +81,10 @@ SQLite at `DB_PATH` (default `/db/stats.db` in production), opened with
 - `ghosts` — `ghost_id` UNIQUE, owner identity, `rom_hash`, `filename`,
   `file_data` BLOB, `frame_count`, `uploaded_at`. Indexed on ROM and
   upload time.
+- `replays` — `replay_id` UNIQUE, uploader identity, ROM, display filename,
+  player names, score/outcome metadata, frame count, session id, and upload
+  time. Indexed on ROM and upload time. Files live at
+  `/db/replays/<replay_id>.ncrp.gz`.
 
 Migrations are `CREATE TABLE IF NOT EXISTS` only — there is no migration
 framework. Adding a column means hand-rolling an `ALTER TABLE` in

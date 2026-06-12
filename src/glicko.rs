@@ -56,7 +56,11 @@ pub struct Rating {
 
 impl Default for Rating {
     fn default() -> Self {
-        Self { mu: DEFAULT_MU, phi: DEFAULT_PHI, sigma: DEFAULT_SIGMA }
+        Self {
+            mu: DEFAULT_MU,
+            phi: DEFAULT_PHI,
+            sigma: DEFAULT_SIGMA,
+        }
     }
 }
 
@@ -145,8 +149,7 @@ fn compute_new_volatility(delta: f64, phi: f64, v: f64, sigma: f64) -> f64 {
     let f = |x: f64| -> f64 {
         let exp_x = x.exp();
         let denom = phi2 + v + exp_x;
-        exp_x * (delta2 - phi2 - v - exp_x) / (2.0 * denom.powi(2))
-            - (x - a) / TAU.powi(2)
+        exp_x * (delta2 - phi2 - v - exp_x) / (2.0 * denom.powi(2)) - (x - a) / TAU.powi(2)
     };
 
     // Choose initial bracket [A, B] containing a root of f.
@@ -193,24 +196,53 @@ mod tests {
     /// post-period values are mu≈1464.06, phi≈151.52, sigma≈0.05999.
     #[test]
     fn glickman_worked_example() {
-        let mut player = Rating { mu: 1500.0, phi: 200.0, sigma: 0.06 };
+        let mut player = Rating {
+            mu: 1500.0,
+            phi: 200.0,
+            sigma: 0.06,
+        };
         let results = [
-            PeriodResult { opponent_mu: 1400.0, opponent_phi:  30.0, score: 1.0 },
-            PeriodResult { opponent_mu: 1550.0, opponent_phi: 100.0, score: 0.0 },
-            PeriodResult { opponent_mu: 1700.0, opponent_phi: 300.0, score: 0.0 },
+            PeriodResult {
+                opponent_mu: 1400.0,
+                opponent_phi: 30.0,
+                score: 1.0,
+            },
+            PeriodResult {
+                opponent_mu: 1550.0,
+                opponent_phi: 100.0,
+                score: 0.0,
+            },
+            PeriodResult {
+                opponent_mu: 1700.0,
+                opponent_phi: 300.0,
+                score: 0.0,
+            },
         ];
         update_player_with_results(&mut player, &results);
-        assert!((player.mu - 1464.06).abs() < 0.5,
-                "mu {} != 1464.06", player.mu);
-        assert!((player.phi - 151.52).abs() < 0.5,
-                "phi {} != 151.52", player.phi);
-        assert!((player.sigma - 0.05999).abs() < 0.0005,
-                "sigma {} != 0.05999", player.sigma);
+        assert!(
+            (player.mu - 1464.06).abs() < 0.5,
+            "mu {} != 1464.06",
+            player.mu
+        );
+        assert!(
+            (player.phi - 151.52).abs() < 0.5,
+            "phi {} != 151.52",
+            player.phi
+        );
+        assert!(
+            (player.sigma - 0.05999).abs() < 0.0005,
+            "sigma {} != 0.05999",
+            player.sigma
+        );
     }
 
     #[test]
     fn inactive_player_only_inflates_rd() {
-        let mut player = Rating { mu: 1700.0, phi: 100.0, sigma: 0.06 };
+        let mut player = Rating {
+            mu: 1700.0,
+            phi: 100.0,
+            sigma: 0.06,
+        };
         decay_inactive_player(&mut player);
         assert_eq!(player.mu, 1700.0);
         assert_eq!(player.sigma, 0.06);

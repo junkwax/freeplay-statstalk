@@ -4,7 +4,22 @@ Notes for AI agents (or future-you) working on this service. Companion docs:
 `README.md` for general usage, `claude.md` if it exists for repo-specific
 conventions, `deploy.sh` for the source of truth on deployment.
 
-## Last session: 2026-04-28 (ghost upload refactor)
+## Last session: 2026-06-12 (full replay upload endpoint)
+
+### Full match replay storage
+- Added `POST /replays/upload`, `GET /replays/list`, and
+  `GET /replays/download/:replay_id`.
+- Replay uploads mirror ghost uploads: binary gzip body, JWT-authenticated
+  uploader identity, metadata in `X-Freeplay-*` headers.
+- Replay files are written to `/db/replays/<replay_id>.ncrp.gz` on the
+  GCS-FUSE mount. SQLite stores metadata only.
+- `GET /replays/list` returns the same shape the app and GitHub Pages replay
+  browser use: `{ "replays": [{ "file", "url", "p1", "p2", "frames", ... }] }`.
+- Service split: `freeplay-signaling-server` still handles auth, matchmaking,
+  match results, spectate state, and relay credential minting. `freeplay-relay`
+  is UDP-only. Persistent replay blobs belong here in `freeplay-stats`.
+
+## Previous session: 2026-04-28 (ghost upload refactor)
 
 ### Binary upload with filesystem storage
 - Ghost uploads switched from JSON base64 to binary POST with gzip

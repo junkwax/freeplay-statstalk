@@ -11,9 +11,9 @@
 //! while still giving the math enough match volume per player to behave
 //! correctly.
 
+use crate::db::Db;
 use std::sync::Arc;
 use std::time::Duration;
-use crate::db::Db;
 
 /// Default rating period length. Glickman recommends "the rating period
 /// should be set so that the average player has 5–10 games per period."
@@ -36,14 +36,14 @@ pub fn spawn(db: Arc<Db>) {
             // close_rating_period() takes the SQLite mutex. Run it on a
             // blocking thread so we don't stall the runtime if the batch
             // is large or sqlite has to do meaningful I/O.
-            let result = tokio::task::spawn_blocking(move || db.close_rating_period())
-                .await;
+            let result = tokio::task::spawn_blocking(move || db.close_rating_period()).await;
             match result {
                 Ok(Ok((matches, players))) => {
                     if matches > 0 || players > 0 {
                         tracing::info!(
                             "[rating] closed period — matches={} players_updated={}",
-                            matches, players,
+                            matches,
+                            players,
                         );
                     }
                 }

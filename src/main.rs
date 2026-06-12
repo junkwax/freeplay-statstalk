@@ -9,8 +9,8 @@ mod rating_period;
 mod state;
 
 use axum::{
-    Router,
     routing::{get, post},
+    Router,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -23,8 +23,10 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "freeplay_stats=debug,tower_http=debug".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "freeplay_stats=debug,tower_http=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -48,9 +50,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/player/:discord_id", get(handlers::player_profile))
         .route("/player/:discord_id/history", get(handlers::player_history))
         // Ghost file storage — upload from client, download for playback
-        .route("/ghosts/upload",           post(handlers::upload_ghost))
-        .route("/ghosts/list",             get(handlers::list_ghosts))
+        .route("/ghosts/upload", post(handlers::upload_ghost))
+        .route("/ghosts/list", get(handlers::list_ghosts))
         .route("/ghosts/download/:ghost_id", get(handlers::download_ghost))
+        // Full match replay storage — Fightcade-style replay browser
+        .route("/replays/upload", post(handlers::upload_replay))
+        .route("/replays/list", get(handlers::list_replays))
+        .route(
+            "/replays/download/:replay_id",
+            get(handlers::download_replay),
+        )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -75,7 +84,9 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => { s.recv().await; }
+            Ok(mut s) => {
+                s.recv().await;
+            }
             Err(_) => std::future::pending::<()>().await,
         }
     };

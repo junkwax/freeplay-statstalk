@@ -10,7 +10,8 @@ pub struct Claims {
 }
 
 pub fn check_api_key(headers: &HeaderMap, expected: &str) -> Result<(), StatusCode> {
-    let auth = headers.get("Authorization")
+    let auth = headers
+        .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let token = auth.strip_prefix("Bearer ").unwrap_or("");
@@ -31,7 +32,8 @@ pub fn verify_jwt(headers: &HeaderMap, secret: Option<&str>) -> Result<Claims, S
         tracing::error!("JWT verification requested but JWT_SECRET is not configured");
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let auth = headers.get("Authorization")
+    let auth = headers
+        .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let token = auth.strip_prefix("Bearer ").unwrap_or("");

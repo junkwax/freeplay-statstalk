@@ -2,15 +2,11 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Json, IntoResponse},
+    response::{IntoResponse, Json},
 };
 use serde::Deserialize;
 
-use crate::{
-    auth,
-    models::*,
-    state::AppState,
-};
+use crate::{auth, models::*, state::AppState};
 
 #[derive(Deserialize)]
 pub struct LeaderboardQuery {
@@ -18,7 +14,9 @@ pub struct LeaderboardQuery {
     pub limit: u32,
 }
 
-fn default_limit() -> u32 { 50 }
+fn default_limit() -> u32 {
+    50
+}
 
 #[derive(Deserialize)]
 pub struct HistoryQuery {
@@ -53,10 +51,14 @@ pub async fn post_result(
         Ok((_winner_rating, _loser_rating)) => {
             // Update usernames so leaderboard/history shows readable names.
             if !result.winner_username.is_empty() {
-                let _ = state.db.update_username(&result.winner_id, &result.winner_username);
+                let _ = state
+                    .db
+                    .update_username(&result.winner_id, &result.winner_username);
             }
             if !result.loser_username.is_empty() {
-                let _ = state.db.update_username(&result.loser_id, &result.loser_username);
+                let _ = state
+                    .db
+                    .update_username(&result.loser_id, &result.loser_username);
             }
 
             // Apply accepted ranked results immediately so Discord summaries
@@ -73,13 +75,17 @@ pub async fn post_result(
             let winner_display = if !result.winner_username.is_empty() {
                 result.winner_username.clone()
             } else {
-                state.db.get_username(&result.winner_id)
+                state
+                    .db
+                    .get_username(&result.winner_id)
                     .unwrap_or_else(|| result.winner_id.clone())
             };
             let loser_display = if !result.loser_username.is_empty() {
                 result.loser_username.clone()
             } else {
-                state.db.get_username(&result.loser_id)
+                state
+                    .db
+                    .get_username(&result.loser_id)
                     .unwrap_or_else(|| result.loser_id.clone())
             };
 
@@ -95,8 +101,10 @@ pub async fn post_result(
 
             tracing::info!(
                 "Match recorded: {} beat {} {}:{} (room={})",
-                result.winner_id, result.loser_id,
-                result.winner_score, result.loser_score,
+                result.winner_id,
+                result.loser_id,
+                result.winner_score,
+                result.loser_score,
                 result.room_id,
             );
 
@@ -170,6 +178,42 @@ fn header_str<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
     headers.get(key)?.to_str().ok()
 }
 
+fn header_u16(headers: &HeaderMap, key: &str) -> Option<u16> {
+    header_str(headers, key).and_then(|s| s.parse().ok())
+}
+
+fn header_u32(headers: &HeaderMap, key: &str) -> Option<u32> {
+    header_str(headers, key).and_then(|s| s.parse().ok())
+}
+
+fn header_bool(headers: &HeaderMap, key: &str) -> bool {
+    matches!(
+        header_str(headers, key).map(|s| s.to_ascii_lowercase()),
+        Some(s) if matches!(s.as_str(), "1" | "true" | "yes")
+    )
+}
+
+fn clean_header_text(raw: &str, max_len: usize) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .take(max_len)
+        .collect()
+}
+
+fn external_base_url(headers: &HeaderMap) -> String {
+    let host = header_str(headers, "x-forwarded-host")
+        .or_else(|| header_str(headers, "host"))
+        .unwrap_or("localhost:8081");
+    let scheme = header_str(headers, "x-forwarded-proto").unwrap_or_else(|| {
+        if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+            "http"
+        } else {
+            "https"
+        }
+    });
+    format!("{scheme}://{host}")
+}
+
 /// Validate a ghost_id is safe to use as a filesystem name. Must be a
 /// short token of safe characters — no dots, slashes, or control chars
 /// that could escape `ghosts_dir` via path traversal. UUIDs and short
@@ -177,7 +221,8 @@ fn header_str<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
 fn is_safe_ghost_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 pub async fn upload_ghost(
@@ -194,11 +239,14 @@ pub async fn upload_ghost(
     let username = claims.username;
 
     let ghost_id = header_str(&headers, "x-freeplay-ghost-id")
-        .unwrap_or_default().to_string();
+        .unwrap_or_default()
+        .to_string();
     let rom_hash = header_str(&headers, "x-freeplay-rom-hash")
-        .unwrap_or_default().to_string();
+        .unwrap_or_default()
+        .to_string();
     let filename_raw = header_str(&headers, "x-freeplay-filename")
-        .unwrap_or_default().to_string();
+        .unwrap_or_default()
+        .to_string();
     let frame_count: u32 = header_str(&headers, "x-freeplay-frame-count")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
@@ -225,16 +273,29 @@ pub async fn upload_ghost(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    state.db.upload_ghost_meta(
-        &ghost_id, &discord_id, &username, &rom_hash, &filename, frame_count,
-    ).map_err(|e| {
-        tracing::error!("Ghost metadata insert failed: {e}");
-        let _ = std::fs::remove_file(&ghost_path);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    state
+        .db
+        .upload_ghost_meta(
+            &ghost_id,
+            &discord_id,
+            &username,
+            &rom_hash,
+            &filename,
+            frame_count,
+        )
+        .map_err(|e| {
+            tracing::error!("Ghost metadata insert failed: {e}");
+            let _ = std::fs::remove_file(&ghost_path);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    tracing::info!("Ghost uploaded: {} by {} ({} frames, {} bytes)",
-        filename, username, frame_count, body.len());
+    tracing::info!(
+        "Ghost uploaded: {} by {} ({} frames, {} bytes)",
+        filename,
+        username,
+        frame_count,
+        body.len()
+    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -289,3 +350,153 @@ pub async fn download_ghost(
     }
 }
 
+// ── POST /replays/upload ───────────────────────────────────────────────────
+//
+// Binary POST with gzip-compressed .ncrp data. Metadata in HTTP headers:
+//   X-Freeplay-Replay-Id, X-Freeplay-Rom-Hash, X-Freeplay-Filename,
+//   X-Freeplay-P1-Name, X-Freeplay-P2-Name, X-Freeplay-P1-Score,
+//   X-Freeplay-P2-Score, X-Freeplay-Winner, X-Freeplay-Frame-Count,
+//   X-Freeplay-Duration, X-Freeplay-Recorded-At, X-Freeplay-Session-Id,
+//   X-Freeplay-Completed-Games, X-Freeplay-Completed-Set
+// Content-Encoding: gzip
+
+pub async fn upload_replay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let claims = crate::auth::verify_jwt(&headers, state.config.jwt_secret.as_deref())?;
+    let discord_id = claims.sub;
+    let username = claims.username;
+
+    let replay_id = header_str(&headers, "x-freeplay-replay-id")
+        .unwrap_or_default()
+        .to_string();
+    let rom_hash = header_str(&headers, "x-freeplay-rom-hash")
+        .unwrap_or_default()
+        .to_string();
+    let filename_raw = header_str(&headers, "x-freeplay-filename").unwrap_or("replay.ncrp");
+
+    if !is_safe_ghost_id(&replay_id) {
+        tracing::warn!("[replay] reject upload - invalid replay_id={:?}", replay_id);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if body.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let filename = clean_header_text(filename_raw, 96);
+    let replay = ReplayMetaInsert {
+        replay_id: replay_id.clone(),
+        discord_id,
+        username,
+        rom_hash: clean_header_text(&rom_hash, 64),
+        filename: if filename.is_empty() {
+            "replay.ncrp".into()
+        } else {
+            filename
+        },
+        p1_name: clean_header_text(
+            header_str(&headers, "x-freeplay-p1-name").unwrap_or("P1"),
+            48,
+        ),
+        p2_name: clean_header_text(
+            header_str(&headers, "x-freeplay-p2-name").unwrap_or("P2"),
+            48,
+        ),
+        p1_score: header_u16(&headers, "x-freeplay-p1-score"),
+        p2_score: header_u16(&headers, "x-freeplay-p2-score"),
+        winner: clean_header_text(header_str(&headers, "x-freeplay-winner").unwrap_or(""), 48),
+        frame_count: header_u32(&headers, "x-freeplay-frame-count").unwrap_or(0),
+        duration: clean_header_text(
+            header_str(&headers, "x-freeplay-duration").unwrap_or(""),
+            32,
+        ),
+        recorded_at: clean_header_text(
+            header_str(&headers, "x-freeplay-recorded-at")
+                .or_else(|| header_str(&headers, "x-freeplay-recorded-unix"))
+                .unwrap_or(""),
+            64,
+        ),
+        session_id: clean_header_text(
+            header_str(&headers, "x-freeplay-session-id").unwrap_or(""),
+            96,
+        ),
+        completed_games: header_u32(&headers, "x-freeplay-completed-games").unwrap_or(0),
+        completed_set: header_bool(&headers, "x-freeplay-completed-set"),
+    };
+
+    let replay_path = state.replays_dir.join(format!("{replay_id}.ncrp.gz"));
+    std::fs::write(&replay_path, &body).map_err(|e| {
+        tracing::error!("Failed to write replay file {}: {e}", replay_path.display());
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    state.db.upload_replay_meta(&replay).map_err(|e| {
+        tracing::error!("Replay metadata insert failed: {e}");
+        let _ = std::fs::remove_file(&replay_path);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tracing::info!(
+        "Replay uploaded: {} by {} ({} frames, {} bytes)",
+        replay.filename,
+        replay.username,
+        replay.frame_count,
+        body.len()
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ── GET /replays/list ──────────────────────────────────────────────────────
+
+pub async fn list_replays(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ReplayListQuery>,
+) -> Result<Json<ReplayListResponse>, StatusCode> {
+    let base_url = external_base_url(&headers);
+    match state.db.list_replays(&q.rom_hash, q.limit) {
+        Ok(mut replays) => {
+            for replay in &mut replays {
+                replay.url = format!("{base_url}/replays/download/{}", replay.replay_id);
+            }
+            Ok(Json(ReplayListResponse { replays }))
+        }
+        Err(e) => {
+            tracing::error!("Replay list failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// ── GET /replays/download/:replay_id ───────────────────────────────────────
+
+pub async fn download_replay(
+    State(state): State<AppState>,
+    Path(replay_id): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if !is_safe_ghost_id(&replay_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let filename = match state.db.replay_filename(&replay_id) {
+        Ok(Some(filename)) => filename,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Replay metadata lookup failed: {e}");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let replay_path = state.replays_dir.join(format!("{replay_id}.ncrp.gz"));
+    let data = std::fs::read(&replay_path).map_err(|e| {
+        tracing::error!("Replay file read failed {}: {e}", replay_path.display());
+        StatusCode::NOT_FOUND
+    })?;
+    let filename_header = format!("attachment; filename=\"{filename}\"");
+    Ok(axum::response::Response::builder()
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Encoding", "gzip")
+        .header("Content-Disposition", filename_header)
+        .body(axum::body::Body::from(data))
+        .unwrap())
+}
