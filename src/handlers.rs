@@ -411,7 +411,7 @@ pub async fn download_ghost(
     if !is_safe_ghost_id(&ghost_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    match state.db.download_ghost(&ghost_id) {
+    match state.db.download_ghost(&ghost_id, &state.ghosts_dir) {
         Ok(Some((filename, encoding, data))) => {
             let content_type = "application/octet-stream";
             let filename_header = format!("attachment; filename=\"{filename}\"");

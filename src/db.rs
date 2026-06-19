@@ -552,13 +552,19 @@ impl Db {
         Ok(())
     }
 
-    /// Read a ghost file. Tries filesystem first (new gzip'd format at
-    /// `ghosts/<ghost_id>.ncgh.gz`), then falls back to the SQLite BLOB
-    /// (old base64-encoded uploads). Returns the raw bytes (still gzip'd
-    /// for new uploads, raw .ncgh for old).
+    /// Read a ghost file. Tries the filesystem first (new gzip'd uploads at
+    /// `<ghosts_dir>/<ghost_id>.ncgh.gz`), then falls back to the SQLite BLOB
+    /// (old base64-encoded uploads). Returns the raw bytes (still gzip'd for new
+    /// uploads, raw .ncgh for old).
+    ///
+    /// `ghosts_dir` MUST be the same configured directory the upload writes to
+    /// (the GCS-FUSE mount). A previous version read a path relative to the
+    /// process CWD, so it never found files the uploader wrote under the
+    /// absolute mount path — every new ghost 404'd.
     pub fn download_ghost(
         &self,
         ghost_id: &str,
+        ghosts_dir: &std::path::Path,
     ) -> anyhow::Result<Option<(String, String, Vec<u8>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -570,7 +576,7 @@ impl Db {
             Some(v) => v,
             None => return Ok(None),
         };
-        let fs_path = format!("ghosts/{ghost_id}.ncgh.gz");
+        let fs_path = ghosts_dir.join(format!("{ghost_id}.ncgh.gz"));
         if let Ok(data) = std::fs::read(&fs_path) {
             return Ok(Some((filename, "gzip".into(), data)));
         }
