@@ -166,6 +166,87 @@ pub async fn player_history(
     }
 }
 
+// ── Username registry ─────────────────────────────────────────────────────
+//
+// No API key: clients hit these directly to claim/verify their display name.
+// Claims are keyed by a self-asserted owner_id (discord_id or guest_device_id),
+// which is acceptable because the worst case is a low-value name squat — the
+// registry exists to stop accidental collisions, not to be an identity vault.
+
+/// Server-side name validation, mirroring the client's `sanitize_username`:
+/// 2-24 chars, ASCII alphanumerics plus `_`/`-`. Returns the trimmed name.
+fn validate_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    let len = name.chars().count();
+    if !(2..=24).contains(&len) {
+        return None;
+    }
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+// POST /name/claim — atomically reserve a display name for an owner.
+pub async fn claim_name(
+    State(state): State<AppState>,
+    Json(req): Json<NameClaimRequest>,
+) -> Result<Json<NameClaimResponse>, StatusCode> {
+    let Some(name) = validate_name(&req.name) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if req.owner_id.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match state.db.claim_name(&name, req.owner_id.trim()) {
+        Ok(outcome) => {
+            let status = match outcome {
+                crate::db::NameClaimOutcome::Claimed => "claimed",
+                crate::db::NameClaimOutcome::Owned => "owned",
+                crate::db::NameClaimOutcome::Taken => "taken",
+            };
+            Ok(Json(NameClaimResponse {
+                status: status.to_string(),
+                name,
+            }))
+        }
+        Err(e) => {
+            tracing::error!("name claim failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+// GET /name/check/:name?owner_id=... — availability without reserving.
+pub async fn check_name(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<NameCheckQuery>,
+) -> Result<Json<NameCheckResponse>, StatusCode> {
+    let Some(name) = validate_name(&name) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let owner = if q.owner_id.trim().is_empty() {
+        None
+    } else {
+        Some(q.owner_id.trim())
+    };
+    match state.db.check_name(&name, owner) {
+        Ok(o) => Ok(Json(NameCheckResponse {
+            available: o.available,
+            owned_by_you: o.owned_by_you,
+        })),
+        Err(e) => {
+            tracing::error!("name check failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 // ── POST /ghosts/upload ─────────────────────────────────────────────────────
 //
 // Binary POST with gzip-compressed .ncgh data. Metadata in HTTP headers:

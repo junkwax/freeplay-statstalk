@@ -96,6 +96,16 @@ impl Db {
 
             CREATE INDEX IF NOT EXISTS idx_replays_rom    ON replays(rom_hash);
             CREATE INDEX IF NOT EXISTS idx_replays_upload ON replays(uploaded_at DESC);
+
+            CREATE TABLE IF NOT EXISTS name_registry (
+                name_norm  TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                owner_id   TEXT NOT NULL,
+                claimed_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_name_registry_owner ON name_registry(owner_id);
             ",
         )?;
 
@@ -422,6 +432,80 @@ impl Db {
         Ok(entries)
     }
 
+    // ── Username registry (true global reservation) ─────────────────────────
+
+    /// Atomically reserve `name` for `owner_id`. Names are unique
+    /// case-insensitively. An owner holds exactly one name: claiming a new one
+    /// releases their previous reservation (rename). Returns the outcome.
+    pub fn claim_name(&self, name: &str, owner_id: &str) -> anyhow::Result<NameClaimOutcome> {
+        let norm = name.trim().to_lowercase();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT owner_id FROM name_registry WHERE name_norm = ?1",
+                params![norm],
+                |r| r.get(0),
+            )
+            .ok();
+
+        let outcome = match existing {
+            Some(owner) if owner == owner_id => {
+                // Already yours — refresh the display spelling and timestamp.
+                tx.execute(
+                    "UPDATE name_registry SET name = ?1, updated_at = ?2 WHERE name_norm = ?3",
+                    params![name, now, norm],
+                )?;
+                NameClaimOutcome::Owned
+            }
+            Some(_) => NameClaimOutcome::Taken,
+            None => {
+                // Release any name this owner previously held (rename), then claim.
+                tx.execute(
+                    "DELETE FROM name_registry WHERE owner_id = ?1",
+                    params![owner_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO name_registry (name_norm, name, owner_id, claimed_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?4)",
+                    params![norm, name, owner_id, now],
+                )?;
+                NameClaimOutcome::Claimed
+            }
+        };
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    /// Is `name` available? Available means unclaimed, or already owned by
+    /// `owner_id` (so re-checking your own name reads as available).
+    pub fn check_name(&self, name: &str, owner_id: Option<&str>) -> anyhow::Result<NameCheckOutcome> {
+        let norm = name.trim().to_lowercase();
+        let conn = self.conn.lock().unwrap();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT owner_id FROM name_registry WHERE name_norm = ?1",
+                params![norm],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(match owner {
+            None => NameCheckOutcome {
+                available: true,
+                owned_by_you: false,
+            },
+            Some(o) => {
+                let mine = owner_id.map(|id| id == o).unwrap_or(false);
+                NameCheckOutcome {
+                    available: mine,
+                    owned_by_you: mine,
+                }
+            }
+        })
+    }
+
     pub fn get_username(&self, discord_id: &str) -> Option<String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -642,6 +726,24 @@ impl Db {
 
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
+
+/// Result of [`Db::claim_name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameClaimOutcome {
+    /// Newly reserved for this owner.
+    Claimed,
+    /// Already held by this same owner (re-affirmed).
+    Owned,
+    /// Held by a different owner.
+    Taken,
+}
+
+/// Result of [`Db::check_name`].
+#[derive(Debug, Clone, Copy)]
+pub struct NameCheckOutcome {
+    pub available: bool,
+    pub owned_by_you: bool,
 }
 
 fn read_rating(conn: &Connection, discord_id: &str) -> anyhow::Result<Rating> {

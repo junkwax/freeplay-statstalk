@@ -157,3 +157,32 @@ pub struct ReplayMetaInsert {
 fn default_replay_limit() -> u32 {
     50
 }
+
+// ── Username registry ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NameClaimRequest {
+    pub name: String,
+    /// Stable identity of the claimant — discord_id when signed in, else the
+    /// client's guest_device_id.
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NameClaimResponse {
+    /// "claimed" (newly reserved), "owned" (already yours), or "taken".
+    pub status: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NameCheckQuery {
+    #[serde(default)]
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NameCheckResponse {
+    pub available: bool,
+    pub owned_by_you: bool,
+}

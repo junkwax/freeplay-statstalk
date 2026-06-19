@@ -49,6 +49,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/leaderboard", get(handlers::leaderboard))
         .route("/player/:discord_id", get(handlers::player_profile))
         .route("/player/:discord_id/history", get(handlers::player_history))
+        // Username registry — claim a globally-unique display name / check one.
+        .route("/name/claim", post(handlers::claim_name))
+        .route("/name/check/:name", get(handlers::check_name))
         // Ghost file storage — upload from client, download for playback
         .route("/ghosts/upload", post(handlers::upload_ghost))
         .route("/ghosts/list", get(handlers::list_ghosts))
