@@ -1,0 +1,5 @@
+# gcloud builds submit: upload only what the Dockerfile needs (no .env, DB backups or build output)
+.gcloudignore
+.git
+#!include:.gitignore
+backups/
