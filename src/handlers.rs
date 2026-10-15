@@ -156,6 +156,44 @@ pub async fn leaderboard(
     }
 }
 
+// ── POST /location ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct LocationReq {
+    pub discord_id: String,
+    /// a game key, or a rom_hash with its "<game>:" prefix (as results carry it)
+    #[serde(default)]
+    pub game: Option<String>,
+    #[serde(default)]
+    pub rom_hash: Option<String>,
+    pub loc: String,
+}
+
+/// A service (API key) tells where a player plays from; shown next to their name on the boards.
+pub async fn set_location(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LocationReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::check_api_key(&headers, &state.config.stats_api_key)?;
+    let game = match (&req.game, &req.rom_hash) {
+        (Some(g), _) => crate::game::from_query(Some(g)),
+        (None, Some(h)) => crate::game::from_rom_hash(h),
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let loc: String = req.loc.trim().to_uppercase().chars().take(12).collect();
+    if req.discord_id.trim().is_empty() || loc.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match state.db.set_location(&req.discord_id, &game, &loc) {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => {
+            tracing::error!("set_location failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 // ── GET /leaderboard/period ───────────────────────────────────────────────
 
 #[derive(Deserialize)]

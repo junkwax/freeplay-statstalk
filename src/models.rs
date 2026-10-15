@@ -40,6 +40,8 @@ pub struct LeaderboardEntry {
     pub wins: u64,
     pub losses: u64,
     pub matches_played: u64,
+    /// where the player plays from (Wavenet); empty when unknown
+    pub loc: String,
 }
 
 /// One row of a time-window board (`GET /leaderboard/period`): wins/losses in the window only.
@@ -50,6 +52,7 @@ pub struct PeriodEntry {
     pub username: String,
     pub wins: u64,
     pub losses: u64,
+    pub loc: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

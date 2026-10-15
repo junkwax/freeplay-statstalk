@@ -149,6 +149,18 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_matches_game ON matches(game, applied_at);",
         )?;
 
+        // Step 4b: where each player says they play from, per game (Wavenet cabinets show it next to the
+        // name: "YOU ARE PLAYING BOB AT RED COURT", and on the boards). Additive; no existing data changes.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS player_locations (
+                discord_id TEXT NOT NULL,
+                game       TEXT NOT NULL,
+                loc        TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (discord_id, game)
+            );",
+        )?;
+
         // Step 5: carry the existing ratings over as MK2, exactly once.
         // user_version marks it done; re-seeding on every boot would give
         // anyone who only ever played another game an empty MK2 row.
@@ -318,6 +330,17 @@ impl Db {
         read_rating(&conn, discord_id, game)
     }
 
+    /// Remember a player's location for a game (latest wins).
+    pub fn set_location(&self, discord_id: &str, game: &str, loc: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO player_locations (discord_id, game, loc, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (discord_id, game) DO UPDATE SET loc = excluded.loc, updated_at = excluded.updated_at",
+            params![discord_id, game, loc, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn get_leaderboard(
         &self,
         limit: u32,
@@ -329,9 +352,10 @@ impl Db {
         const MIN_PLACEMENT_MATCHES: u32 = 1;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT g.discord_id, p.username, g.mu, g.wins, g.losses, g.draws
+            "SELECT g.discord_id, p.username, g.mu, g.wins, g.losses, g.draws, COALESCE(l.loc, '')
              FROM game_ratings g
              JOIN players p ON p.discord_id = g.discord_id
+             LEFT JOIN player_locations l ON l.discord_id = g.discord_id AND l.game = g.game
              WHERE g.game = ?3 AND g.wins + g.losses + g.draws >= ?1
              ORDER BY g.mu DESC
              LIMIT ?2",
@@ -349,6 +373,7 @@ impl Db {
                     wins,
                     losses,
                     matches_played: wins + losses + draws,
+                    loc: r.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -389,8 +414,10 @@ impl Db {
                  UNION ALL
                  SELECT loser_id AS id, 0 AS w, 1 AS l, played_at FROM m
              )
-             SELECT t.id, COALESCE(p.username, t.id), SUM(t.w), SUM(t.l), MAX(CASE WHEN t.w = 1 THEN t.played_at END)
+             SELECT t.id, COALESCE(p.username, t.id), SUM(t.w), SUM(t.l), MAX(CASE WHEN t.w = 1 THEN t.played_at END),
+                    COALESCE(l.loc, '')
              FROM t LEFT JOIN players p ON p.discord_id = t.id
+             LEFT JOIN player_locations l ON l.discord_id = t.id AND l.game = ?1
              GROUP BY t.id
              ORDER BY SUM(t.w) DESC, SUM(t.l) ASC, MAX(CASE WHEN t.w = 1 THEN t.played_at END) ASC
              LIMIT ?5",
@@ -403,6 +430,7 @@ impl Db {
                     username: r.get(1)?,
                     wins: r.get::<_, i64>(2)? as u64,
                     losses: r.get::<_, i64>(3)? as u64,
+                    loc: r.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
