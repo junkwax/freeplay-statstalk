@@ -161,6 +161,37 @@ impl Db {
             );",
         )?;
 
+        // Step 4c: Wavenet cabinets' tournament prize entries (the player's mailing address, sent after a strong
+        // tournament streak) and their bookkeeping (the NSS audit poll). Additive; no existing data changes.
+        // entry_id is the cabinet's random id for one entry: it resends until acked, so it dedupes retries.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tournament_prizes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_id TEXT NOT NULL,
+                username   TEXT NOT NULL,
+                game       TEXT NOT NULL,
+                entry_id   INTEGER NOT NULL,
+                tournament TEXT NOT NULL,
+                wins       INTEGER NOT NULL,
+                initials   TEXT NOT NULL,
+                location   TEXT NOT NULL,
+                full_name  TEXT NOT NULL,
+                street     TEXT NOT NULL,
+                city_state TEXT NOT NULL,
+                zip        TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (discord_id, game, entry_id)
+            );
+            CREATE TABLE IF NOT EXISTS cabinet_audits (
+                discord_id TEXT NOT NULL,
+                game       TEXT NOT NULL,
+                loc        TEXT NOT NULL,
+                audits     TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (discord_id, game)
+            );",
+        )?;
+
         // Step 5: carry the existing ratings over as MK2, exactly once.
         // user_version marks it done; re-seeding on every boot would give
         // anyone who only ever played another game an empty MK2 row.
@@ -339,6 +370,85 @@ impl Db {
             params![discord_id, game, loc, chrono::Utc::now().to_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// Store a tournament prize entry; a resend of the same entry (same entry_id) is a no-op.
+    pub fn add_prize(&self, p: &crate::models::PrizeEntry) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO tournament_prizes (discord_id, username, game, entry_id, tournament, wins, initials,
+                 location, full_name, street, city_state, zip, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                p.discord_id, p.username, p.game, p.entry_id, p.tournament, p.wins, p.initials, p.location,
+                p.full_name, p.street, p.city_state, p.zip,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_prizes(&self, game: &str) -> anyhow::Result<Vec<crate::models::PrizeEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT discord_id, username, game, entry_id, tournament, wins, initials, location, full_name, street,
+                    city_state, zip, created_at
+             FROM tournament_prizes WHERE game = ?1 ORDER BY id DESC LIMIT 500",
+        )?;
+        let rows = stmt
+            .query_map(params![game], |r| {
+                Ok(crate::models::PrizeEntry {
+                    discord_id: r.get(0)?,
+                    username: r.get(1)?,
+                    game: r.get(2)?,
+                    entry_id: r.get(3)?,
+                    tournament: r.get(4)?,
+                    wins: r.get(5)?,
+                    initials: r.get(6)?,
+                    location: r.get(7)?,
+                    full_name: r.get(8)?,
+                    street: r.get(9)?,
+                    city_state: r.get(10)?,
+                    zip: r.get(11)?,
+                    created_at: r.get(12)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A cabinet's latest bookkeeping (JSON object of counters), one row per player and game.
+    pub fn set_cabinet_audits(&self, discord_id: &str, game: &str, loc: &str, audits: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cabinet_audits (discord_id, game, loc, audits, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (discord_id, game) DO UPDATE SET loc = excluded.loc, audits = excluded.audits,
+                 updated_at = excluded.updated_at",
+            params![discord_id, game, loc, audits, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_cabinet_audits(&self, game: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT a.discord_id, COALESCE(p.username, a.discord_id), a.loc, a.audits, a.updated_at
+             FROM cabinet_audits a LEFT JOIN players p ON p.discord_id = a.discord_id
+             WHERE a.game = ?1 ORDER BY a.updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![game], |r| {
+                let audits: String = r.get(3)?;
+                Ok(serde_json::json!({
+                    "discord_id": r.get::<_, String>(0)?,
+                    "username": r.get::<_, String>(1)?,
+                    "loc": r.get::<_, String>(2)?,
+                    "audits": serde_json::from_str::<serde_json::Value>(&audits).unwrap_or(serde_json::Value::Null),
+                    "updated_at": r.get::<_, String>(4)?,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn get_leaderboard(

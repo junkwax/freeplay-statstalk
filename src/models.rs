@@ -45,6 +45,27 @@ pub struct LeaderboardEntry {
 }
 
 /// One row of a time-window board (`GET /leaderboard/period`): wins/losses in the window only.
+/// A Wavenet tournament prize entry (the cabinet's "YOU MAY QUALIFY FOR A PRIZE" form).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrizeEntry {
+    pub discord_id: String,
+    #[serde(default)]
+    pub username: String,
+    pub game: String,
+    pub entry_id: i64,
+    #[serde(default)]
+    pub tournament: String,
+    pub wins: i64,
+    pub initials: String,
+    pub location: String,
+    pub full_name: String,
+    pub street: String,
+    pub city_state: String,
+    pub zip: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PeriodEntry {
     pub rank: u64,

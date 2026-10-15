@@ -194,6 +194,102 @@ pub async fn set_location(
     }
 }
 
+// ── Wavenet cabinets: prize entries and bookkeeping (API key only; personal data) ──
+
+fn clean(s: &str, max: usize) -> String {
+    s.chars().filter(|c| c.is_ascii() && !c.is_ascii_control()).take(max).collect::<String>().trim().to_string()
+}
+
+/// POST /prize: a service stores a tournament prize entry (idempotent per entry_id).
+pub async fn add_prize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut p): Json<PrizeEntry>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::check_api_key(&headers, &state.config.stats_api_key)?;
+    p.game = crate::game::from_query(Some(&p.game));
+    for (f, n) in [
+        (&mut p.username, 32),
+        (&mut p.tournament, 40),
+        (&mut p.initials, 10),
+        (&mut p.location, 16),
+        (&mut p.full_name, 20),
+        (&mut p.street, 20),
+        (&mut p.city_state, 20),
+        (&mut p.zip, 10),
+    ] {
+        *f = clean(f, n);
+    }
+    if p.discord_id.trim().is_empty() || p.full_name.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match state.db.add_prize(&p) {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => {
+            tracing::error!("add_prize failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// GET /prizes?game=umk3w (API key): the entries, newest first.
+pub async fn list_prizes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<GameQuery>,
+) -> Result<Json<Vec<PrizeEntry>>, StatusCode> {
+    auth::check_api_key(&headers, &state.config.stats_api_key)?;
+    let game = crate::game::from_query(q.game.as_deref());
+    state.db.list_prizes(&game).map(Json).map_err(|e| {
+        tracing::error!("list_prizes failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[derive(Deserialize)]
+pub struct CabinetAuditsReq {
+    pub discord_id: String,
+    pub game: String,
+    #[serde(default)]
+    pub loc: String,
+    pub audits: serde_json::Map<String, serde_json::Value>,
+}
+
+/// POST /cabinet_audits: a service stores a cabinet's latest bookkeeping.
+pub async fn set_cabinet_audits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CabinetAuditsReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    auth::check_api_key(&headers, &state.config.stats_api_key)?;
+    if req.discord_id.trim().is_empty() || req.audits.values().any(|v| !v.is_number()) || req.audits.len() > 40 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let game = crate::game::from_query(Some(&req.game));
+    let audits = serde_json::Value::Object(req.audits).to_string();
+    match state.db.set_cabinet_audits(&req.discord_id, &game, &clean(&req.loc, 16), &audits) {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => {
+            tracing::error!("set_cabinet_audits failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// GET /cabinet_audits?game=umk3w (API key): every cabinet's latest bookkeeping.
+pub async fn list_cabinet_audits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<GameQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    auth::check_api_key(&headers, &state.config.stats_api_key)?;
+    let game = crate::game::from_query(q.game.as_deref());
+    state.db.list_cabinet_audits(&game).map(Json).map_err(|e| {
+        tracing::error!("list_cabinet_audits failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 // ── GET /leaderboard/period ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
