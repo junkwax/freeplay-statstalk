@@ -156,6 +156,56 @@ pub async fn leaderboard(
     }
 }
 
+// ── GET /leaderboard/period ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct PeriodQuery {
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub game: Option<String>,
+    /// Window start, unix seconds (inclusive).
+    pub since: i64,
+    /// Window end, unix seconds (exclusive); absent = now.
+    #[serde(default)]
+    pub until: Option<i64>,
+    /// Comma-separated player ids whose matches don't count (e.g. bots).
+    #[serde(default)]
+    pub exclude: Option<String>,
+}
+
+/// Wins/losses per player in a time window (weekly boards, tournaments), people only when `exclude` names the bots.
+pub async fn period_leaderboard(
+    State(state): State<AppState>,
+    Query(q): Query<PeriodQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let limit = q.limit.min(100).max(1);
+    let game = crate::game::from_query(q.game.as_deref());
+    let ts = |s: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0)
+            .map(|t| t.to_rfc3339())
+            .ok_or(StatusCode::BAD_REQUEST)
+    };
+    let since = ts(q.since)?;
+    let until = ts(q.until.unwrap_or_else(|| chrono::Utc::now().timestamp() + 1))?;
+    let exclude: Vec<String> = q
+        .exclude
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    match state.db.get_period_board(&game, &since, &until, &exclude, limit) {
+        Ok(entries) => Ok(Json(serde_json::json!({ "entries": entries, "since": since, "until": until }))),
+        Err(e) => {
+            tracing::error!("Period leaderboard query failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 // ── GET /player/:discord_id ───────────────────────────────────────────────
 
 pub async fn player_profile(

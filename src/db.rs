@@ -364,6 +364,58 @@ impl Db {
         Ok(ranked)
     }
 
+    /// Wins/losses per player over matches of `game` played in `[since, until)` (RFC 3339, UTC, the format
+    /// `played_at` is written in). A match with a player in `exclude` on either side doesn't count at all
+    /// (freeplay-wavenet passes its bots, so a tournament or weekly board is people against people).
+    /// Ordered by wins, then fewer losses, then who got there first.
+    pub fn get_period_board(
+        &self,
+        game: &str,
+        since: &str,
+        until: &str,
+        exclude: &[String],
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::models::PeriodEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let ex = serde_json::to_string(exclude)?;
+        let mut stmt = conn.prepare(
+            "WITH m AS (
+                 SELECT winner_id, loser_id, played_at FROM matches
+                 WHERE game = ?1 AND played_at >= ?2 AND played_at < ?3
+                   AND winner_id NOT IN (SELECT value FROM json_each(?4))
+                   AND loser_id NOT IN (SELECT value FROM json_each(?4))
+             ), t AS (
+                 SELECT winner_id AS id, 1 AS w, 0 AS l, played_at FROM m
+                 UNION ALL
+                 SELECT loser_id AS id, 0 AS w, 1 AS l, played_at FROM m
+             )
+             SELECT t.id, COALESCE(p.username, t.id), SUM(t.w), SUM(t.l), MAX(CASE WHEN t.w = 1 THEN t.played_at END)
+             FROM t LEFT JOIN players p ON p.discord_id = t.id
+             GROUP BY t.id
+             ORDER BY SUM(t.w) DESC, SUM(t.l) ASC, MAX(CASE WHEN t.w = 1 THEN t.played_at END) ASC
+             LIMIT ?5",
+        )?;
+        let rows = stmt
+            .query_map(params![game, since, until, ex, limit], |r| {
+                Ok(crate::models::PeriodEntry {
+                    rank: 0,
+                    discord_id: r.get(0)?,
+                    username: r.get(1)?,
+                    wins: r.get::<_, i64>(2)? as u64,
+                    losses: r.get::<_, i64>(3)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut e)| {
+                e.rank = (i + 1) as u64;
+                e
+            })
+            .collect())
+    }
+
     pub fn get_match_history(
         &self,
         discord_id: &str,

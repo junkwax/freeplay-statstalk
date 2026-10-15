@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/results", post(handlers::post_result))
         .route("/leaderboard", get(handlers::leaderboard))
+        .route("/leaderboard/period", get(handlers::period_leaderboard))
         .route("/player/:discord_id", get(handlers::player_profile))
         .route("/player/:discord_id/history", get(handlers::player_history))
         // Username registry — claim a globally-unique display name / check one.

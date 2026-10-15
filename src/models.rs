@@ -42,6 +42,16 @@ pub struct LeaderboardEntry {
     pub matches_played: u64,
 }
 
+/// One row of a time-window board (`GET /leaderboard/period`): wins/losses in the window only.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeriodEntry {
+    pub rank: u64,
+    pub discord_id: String,
+    pub username: String,
+    pub wins: u64,
+    pub losses: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MatchHistoryEntry {
     pub room_id: String,
