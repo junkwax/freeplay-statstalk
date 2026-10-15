@@ -12,6 +12,15 @@ use crate::{auth, models::*, state::AppState};
 pub struct LeaderboardQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Which game's ratings. Absent means MK2 (see `game::from_query`).
+    #[serde(default)]
+    pub game: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct GameQuery {
+    #[serde(default)]
+    pub game: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -22,6 +31,8 @@ fn default_limit() -> u32 {
 pub struct HistoryQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
+    #[serde(default)]
+    pub game: Option<String>,
 }
 
 // ── POST /results ─────────────────────────────────────────────────────────
@@ -68,8 +79,15 @@ pub async fn post_result(
             if let Err(e) = state.db.close_rating_period() {
                 tracing::error!("Failed to close rating period after result: {e}");
             }
-            let winner_rating = state.db.get_rating(&result.winner_id).unwrap_or_default();
-            let loser_rating = state.db.get_rating(&result.loser_id).unwrap_or_default();
+            let game = crate::game::from_rom_hash(&result.rom_hash);
+            let winner_rating = state
+                .db
+                .get_rating(&result.winner_id, &game)
+                .unwrap_or_default();
+            let loser_rating = state
+                .db
+                .get_rating(&result.loser_id, &game)
+                .unwrap_or_default();
 
             // Resolve display names: request username > stored username > discord_id.
             let winner_display = if !result.winner_username.is_empty() {
@@ -89,18 +107,22 @@ pub async fn post_result(
                     .unwrap_or_else(|| result.loser_id.clone())
             };
 
-            // Fire-and-forget Discord notification.
-            state.discord.notify_match(
-                &winner_display,
-                &loser_display,
-                result.winner_score,
-                result.loser_score,
-                winner_rating.mu,
-                loser_rating.mu,
-            );
+            // Fire-and-forget Discord notification (unless the game is muted).
+            if !crate::game::discord_muted(&game) {
+                state.discord.notify_match(
+                    crate::game::display_name(&game),
+                    &winner_display,
+                    &loser_display,
+                    result.winner_score,
+                    result.loser_score,
+                    winner_rating.mu,
+                    loser_rating.mu,
+                );
+            }
 
             tracing::info!(
-                "Match recorded: {} beat {} {}:{} (room={})",
+                "Match recorded: [{}] {} beat {} {}:{} (room={})",
+                game,
                 result.winner_id,
                 result.loser_id,
                 result.winner_score,
@@ -124,7 +146,8 @@ pub async fn leaderboard(
     Query(q): Query<LeaderboardQuery>,
 ) -> Result<Json<LeaderboardResponse>, StatusCode> {
     let limit = q.limit.min(100).max(1);
-    match state.db.get_leaderboard(limit) {
+    let game = crate::game::from_query(q.game.as_deref());
+    match state.db.get_leaderboard(limit, &game) {
         Ok(entries) => Ok(Json(LeaderboardResponse { entries })),
         Err(e) => {
             tracing::error!("Leaderboard query failed: {e}");
@@ -138,8 +161,10 @@ pub async fn leaderboard(
 pub async fn player_profile(
     State(state): State<AppState>,
     Path(discord_id): Path<String>,
+    Query(q): Query<GameQuery>,
 ) -> Result<Json<PlayerProfile>, StatusCode> {
-    match state.db.get_player(&discord_id) {
+    let game = crate::game::from_query(q.game.as_deref());
+    match state.db.get_player(&discord_id, &game) {
         Ok(Some(profile)) => Ok(Json(profile)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
@@ -157,7 +182,8 @@ pub async fn player_history(
     Query(q): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, StatusCode> {
     let limit = q.limit.min(100).max(1);
-    match state.db.get_match_history(&discord_id, limit) {
+    let game = crate::game::from_query(q.game.as_deref());
+    match state.db.get_match_history(&discord_id, limit, &game) {
         Ok(matches) => Ok(Json(HistoryResponse { matches })),
         Err(e) => {
             tracing::error!("Match history query failed: {e}");

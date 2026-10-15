@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod db;
 mod discord;
+mod game;
 mod glicko;
 mod handlers;
 mod models;

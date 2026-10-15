@@ -42,9 +42,22 @@ It also stores community replay files:
   ```
   Re-posting the same `room_id` is a no-op (UNIQUE constraint).
 
+### Ratings are per game
+
+Each game is its own Glicko-2 pool (`game_ratings`, keyed by player and
+game). The game comes from `rom_hash`: the client prefixes it for anything
+but MK2 (`nbajam:<fnv>@<core>#<actions>`), and an unprefixed hash is MK2,
+which is what every client before multi-game support sent. The signaling
+server forwards `rom_hash` untouched, so it needed no change. On first boot
+after upgrading, existing ratings are copied into the `mk2` pool once
+(`PRAGMA user_version` = 1); `players` remains the identity table.
+
+The read endpoints below take `?game=<key>` (`mk2`, `nbajam`); absent or
+invalid means `mk2`.
+
 ### Leaderboard / players (public reads)
 - `GET /health` — returns `ok`.
-- `GET /leaderboard?limit=50` — top players by Glicko `mu`, descending.
+- `GET /leaderboard?limit=50&game=mk2` — top players by Glicko `mu` in that game, descending.
   Limit clamped to `[1, 100]`. Players with zero matches are excluded.
 - `GET /player/:discord_id` — full profile (rating, RD, volatility, W/L/D).
   404 if unknown.

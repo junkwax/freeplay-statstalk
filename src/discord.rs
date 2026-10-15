@@ -18,6 +18,7 @@ impl Discord {
 
     pub fn notify_match(
         &self,
+        game_name: &str,
         winner_name: &str,
         loser_name: &str,
         winner_score: u16,
@@ -31,7 +32,7 @@ impl Discord {
         }
 
         let msg = format!(
-            ":trophy: **{winner_name}** ({winner_score}) beats **{loser_name}** ({loser_score})\n\
+            ":trophy: [{game_name}] **{winner_name}** ({winner_score}) beats **{loser_name}** ({loser_score})\n\
             {winner_name}: **{winner_rating:.0}** rating\n\
             {loser_name}: **{loser_rating:.0}** rating",
         );

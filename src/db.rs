@@ -124,6 +124,47 @@ impl Db {
             [],
         )?;
 
+        // Step 4: ratings are per game. `players` stays the identity table
+        // (username, and the legacy rating columns nothing reads any more);
+        // every rating and W/L now lives in `game_ratings`, one row per
+        // (player, game). Every match recorded before this existed was MK2.
+        let _ = conn.execute(
+            "ALTER TABLE matches ADD COLUMN game TEXT NOT NULL DEFAULT 'mk2'",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS game_ratings (
+                discord_id TEXT NOT NULL REFERENCES players(discord_id),
+                game       TEXT NOT NULL,
+                mu         REAL NOT NULL DEFAULT 1500.0,
+                phi        REAL NOT NULL DEFAULT 350.0,
+                sigma      REAL NOT NULL DEFAULT 0.06,
+                wins       INTEGER NOT NULL DEFAULT 0,
+                losses     INTEGER NOT NULL DEFAULT 0,
+                draws      INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (discord_id, game)
+            );
+            CREATE INDEX IF NOT EXISTS idx_game_ratings_board ON game_ratings(game, mu DESC);
+            CREATE INDEX IF NOT EXISTS idx_matches_game ON matches(game, applied_at);",
+        )?;
+
+        // Step 5: carry the existing ratings over as MK2, exactly once.
+        // user_version marks it done; re-seeding on every boot would give
+        // anyone who only ever played another game an empty MK2 row.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            conn.execute_batch(
+                "BEGIN;
+                 INSERT OR IGNORE INTO game_ratings
+                     (discord_id, game, mu, phi, sigma, wins, losses, draws, updated_at)
+                 SELECT discord_id, 'mk2', mu, phi, sigma, wins, losses, draws, updated_at
+                 FROM players;
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -151,16 +192,19 @@ impl Db {
         rom_hash: &str,
     ) -> anyhow::Result<(Rating, Rating)> {
         let conn = self.conn.lock().unwrap();
+        let game = crate::game::from_rom_hash(rom_hash);
 
-        // Upsert players.
-        conn.execute(
-            "INSERT OR IGNORE INTO players (discord_id) VALUES (?1)",
-            params![winner_id],
-        )?;
-        conn.execute(
-            "INSERT OR IGNORE INTO players (discord_id) VALUES (?1)",
-            params![loser_id],
-        )?;
+        // Upsert players (identity) and their rating row for this game.
+        for id in [winner_id, loser_id] {
+            conn.execute(
+                "INSERT OR IGNORE INTO players (discord_id) VALUES (?1)",
+                params![id],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO game_ratings (discord_id, game) VALUES (?1, ?2)",
+                params![id, game],
+            )?;
+        }
 
         // Insert match — applied_at NULL means "pending, will be picked
         // up by the next rating-period close". INSERT OR IGNORE on
@@ -168,26 +212,28 @@ impl Db {
         let now = chrono::Utc::now().to_rfc3339();
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO matches
-             (room_id, winner_id, loser_id, winner_score, loser_score, rom_hash, played_at, applied_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-            params![room_id, winner_id, loser_id, winner_score, loser_score, rom_hash, now],
+             (room_id, winner_id, loser_id, winner_score, loser_score, rom_hash, played_at, applied_at, game)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+            params![room_id, winner_id, loser_id, winner_score, loser_score, rom_hash, now, game],
         )?;
 
         // Only bump W/L if this row was newly inserted (not a duplicate).
         if inserted > 0 {
             conn.execute(
-                "UPDATE players SET wins = wins + 1, updated_at = ?1 WHERE discord_id = ?2",
-                params![now, winner_id],
+                "UPDATE game_ratings SET wins = wins + 1, updated_at = ?1
+                 WHERE discord_id = ?2 AND game = ?3",
+                params![now, winner_id, game],
             )?;
             conn.execute(
-                "UPDATE players SET losses = losses + 1, updated_at = ?1 WHERE discord_id = ?2",
-                params![now, loser_id],
+                "UPDATE game_ratings SET losses = losses + 1, updated_at = ?1
+                 WHERE discord_id = ?2 AND game = ?3",
+                params![now, loser_id, game],
             )?;
         }
 
         // Read back current (last-period) ratings for the response.
-        let winner_rating = read_rating(&conn, winner_id)?;
-        let loser_rating = read_rating(&conn, loser_id)?;
+        let winner_rating = read_rating(&conn, winner_id, &game)?;
+        let loser_rating = read_rating(&conn, loser_id, &game)?;
         Ok((winner_rating, loser_rating))
     }
 
@@ -202,118 +248,53 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Snapshot every player's pre-period rating once. We need a
-        // consistent view because each player's results in this period
-        // reference opponents' pre-period ratings, not running ones.
-        let mut stmt = conn.prepare("SELECT discord_id, mu, phi, sigma FROM players")?;
-        let pre_period: std::collections::HashMap<String, Rating> = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    Rating {
-                        mu: r.get(1)?,
-                        phi: r.get(2)?,
-                        sigma: r.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
-
-        // Pull all pending matches once.
+        // Each game is its own Glicko pool: its own pending matches, rated
+        // against opponents' ratings in that game, and RD decay only for
+        // players who have a rating there at all.
         let mut stmt = conn.prepare(
-            "SELECT id, winner_id, loser_id, winner_score, loser_score
-             FROM matches WHERE applied_at IS NULL",
+            "SELECT game FROM game_ratings
+             UNION SELECT game FROM matches WHERE applied_at IS NULL",
         )?;
-        let pending: Vec<(i64, String, String, u16, u16)> = stmt
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
+        let games: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         drop(stmt);
 
-        // Bucket per player.
-        let mut by_player: std::collections::HashMap<String, Vec<PeriodResult>> =
-            std::collections::HashMap::new();
-        for (_id, winner_id, loser_id, _ws, _ls) in &pending {
-            let winner_pre = pre_period.get(winner_id).cloned().unwrap_or_default();
-            let loser_pre = pre_period.get(loser_id).cloned().unwrap_or_default();
-            by_player
-                .entry(winner_id.clone())
-                .or_default()
-                .push(PeriodResult {
-                    opponent_mu: loser_pre.mu,
-                    opponent_phi: loser_pre.phi,
-                    score: 1.0,
-                });
-            by_player
-                .entry(loser_id.clone())
-                .or_default()
-                .push(PeriodResult {
-                    opponent_mu: winner_pre.mu,
-                    opponent_phi: winner_pre.phi,
-                    score: 0.0,
-                });
-        }
-
-        // Apply Glicko-2 to active players, RD-inflate inactives.
-        let mut updated_count = 0usize;
-        let active_set: std::collections::HashSet<&String> = by_player.keys().collect();
-        for (discord_id, mut rating) in pre_period.iter().map(|(k, v)| (k.clone(), v.clone())) {
-            let needs_write = if let Some(results) = by_player.get(&discord_id) {
-                glicko::update_player_with_results(&mut rating, results);
-                true
-            } else if !active_set.contains(&discord_id) {
-                // Tighten phi inflation: only meaningful if any phi growth
-                // would occur. For a brand-new player at default phi=350,
-                // continued inflation is silly (already maximal-uncertainty),
-                // so cap inflation at 350. No-op for a player at exactly 350.
-                let before = rating.phi;
-                glicko::decay_inactive_player(&mut rating);
-                if rating.phi > 350.0 {
-                    rating.phi = 350.0;
-                }
-                // Still write if RD changed measurably.
-                rating.phi != before
-            } else {
-                false
-            };
-            if needs_write {
-                conn.execute(
-                    "UPDATE players SET mu=?1, phi=?2, sigma=?3, updated_at=?4 WHERE discord_id=?5",
-                    params![rating.mu, rating.phi, rating.sigma, now, discord_id],
-                )?;
-                updated_count += 1;
-            }
-        }
-
-        // Mark pending matches as applied.
-        for (id, _, _, _, _) in &pending {
-            conn.execute(
-                "UPDATE matches SET applied_at = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
+        let (mut matches, mut players) = (0usize, 0usize);
+        for game in &games {
+            let (m, p) = close_period_for_game(&conn, game, &now)?;
+            matches += m;
+            players += p;
         }
 
         // Audit row.
         conn.execute(
             "INSERT INTO rating_periods (closed_at, match_count, player_count)
              VALUES (?1, ?2, ?3)",
-            params![now, pending.len() as i64, updated_count as i64],
+            params![now, matches as i64, players as i64],
         )?;
 
-        Ok((pending.len(), updated_count))
+        Ok((matches, players))
     }
 
+    /// A player's profile in one game. A known player who has never played
+    /// that game gets default ratings and zero records rather than a 404:
+    /// they exist, they just haven't played it yet.
     pub fn get_player(
         &self,
         discord_id: &str,
+        game: &str,
     ) -> anyhow::Result<Option<crate::models::PlayerProfile>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT discord_id, username, mu, phi, sigma, wins, losses, draws FROM players WHERE discord_id = ?1"
+            "SELECT p.discord_id, p.username,
+                    COALESCE(g.mu, 1500.0), COALESCE(g.phi, 350.0), COALESCE(g.sigma, 0.06),
+                    COALESCE(g.wins, 0), COALESCE(g.losses, 0), COALESCE(g.draws, 0)
+             FROM players p
+             LEFT JOIN game_ratings g ON g.discord_id = p.discord_id AND g.game = ?2
+             WHERE p.discord_id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![discord_id], |r| {
+        let mut rows = stmt.query_map(params![discord_id, game], |r| {
             let wins: u64 = r.get(5)?;
             let losses: u64 = r.get(6)?;
             let draws: u64 = r.get(7)?;
@@ -332,14 +313,15 @@ impl Db {
         Ok(rows.next().transpose()?)
     }
 
-    pub fn get_rating(&self, discord_id: &str) -> anyhow::Result<Rating> {
+    pub fn get_rating(&self, discord_id: &str, game: &str) -> anyhow::Result<Rating> {
         let conn = self.conn.lock().unwrap();
-        read_rating(&conn, discord_id)
+        read_rating(&conn, discord_id, game)
     }
 
     pub fn get_leaderboard(
         &self,
         limit: u32,
+        game: &str,
     ) -> anyhow::Result<Vec<crate::models::LeaderboardEntry>> {
         // Show players as soon as they have a recorded result. Guest players
         // without a stats email still have a stable guest-device identity, so
@@ -347,14 +329,15 @@ impl Db {
         const MIN_PLACEMENT_MATCHES: u32 = 1;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT discord_id, username, mu, wins, losses, draws
-             FROM players
-             WHERE wins + losses + draws >= ?1
-             ORDER BY mu DESC
+            "SELECT g.discord_id, p.username, g.mu, g.wins, g.losses, g.draws
+             FROM game_ratings g
+             JOIN players p ON p.discord_id = g.discord_id
+             WHERE g.game = ?3 AND g.wins + g.losses + g.draws >= ?1
+             ORDER BY g.mu DESC
              LIMIT ?2",
         )?;
         let entries = stmt
-            .query_map(params![MIN_PLACEMENT_MATCHES, limit], |r| {
+            .query_map(params![MIN_PLACEMENT_MATCHES, limit, game], |r| {
                 let wins: u64 = r.get(3)?;
                 let losses: u64 = r.get(4)?;
                 let draws: u64 = r.get(5)?;
@@ -385,17 +368,18 @@ impl Db {
         &self,
         discord_id: &str,
         limit: u32,
+        game: &str,
     ) -> anyhow::Result<Vec<crate::models::MatchHistoryEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT room_id, winner_id, loser_id, winner_score, loser_score, played_at
              FROM matches
-             WHERE winner_id = ?1 OR loser_id = ?1
+             WHERE (winner_id = ?1 OR loser_id = ?1) AND game = ?3
              ORDER BY played_at DESC
              LIMIT ?2",
         )?;
         let entries = stmt
-            .query_map(params![discord_id, limit], |r| {
+            .query_map(params![discord_id, limit, game], |r| {
                 let winner: String = r.get(1)?;
                 let loser: String = r.get(2)?;
                 let w_score: u16 = r.get(3)?;
@@ -752,10 +736,10 @@ pub struct NameCheckOutcome {
     pub owned_by_you: bool,
 }
 
-fn read_rating(conn: &Connection, discord_id: &str) -> anyhow::Result<Rating> {
+fn read_rating(conn: &Connection, discord_id: &str, game: &str) -> anyhow::Result<Rating> {
     Ok(conn.query_row(
-        "SELECT mu, phi, sigma FROM players WHERE discord_id = ?1",
-        params![discord_id],
+        "SELECT mu, phi, sigma FROM game_ratings WHERE discord_id = ?1 AND game = ?2",
+        params![discord_id, game],
         |r| {
             Ok(Rating {
                 mu: r.get(0)?,
@@ -764,4 +748,194 @@ fn read_rating(conn: &Connection, discord_id: &str) -> anyhow::Result<Rating> {
             })
         },
     )?)
+}
+
+/// One game's share of `close_rating_period`. Returns
+/// (matches_applied, players_updated) for that game.
+fn close_period_for_game(
+    conn: &Connection,
+    game: &str,
+    now: &str,
+) -> anyhow::Result<(usize, usize)> {
+    // Snapshot every player's pre-period rating once. We need a
+    // consistent view because each player's results in this period
+    // reference opponents' pre-period ratings, not running ones.
+    let mut stmt =
+        conn.prepare("SELECT discord_id, mu, phi, sigma FROM game_ratings WHERE game = ?1")?;
+    let pre_period: std::collections::HashMap<String, Rating> = stmt
+        .query_map(params![game], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Rating {
+                    mu: r.get(1)?,
+                    phi: r.get(2)?,
+                    sigma: r.get(3)?,
+                },
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    // Pull this game's pending matches once.
+    let mut stmt = conn.prepare(
+        "SELECT id, winner_id, loser_id FROM matches
+         WHERE applied_at IS NULL AND game = ?1",
+    )?;
+    let pending: Vec<(i64, String, String)> = stmt
+        .query_map(params![game], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    // Bucket per player.
+    let mut by_player: std::collections::HashMap<String, Vec<PeriodResult>> =
+        std::collections::HashMap::new();
+    for (_id, winner_id, loser_id) in &pending {
+        let winner_pre = pre_period.get(winner_id).cloned().unwrap_or_default();
+        let loser_pre = pre_period.get(loser_id).cloned().unwrap_or_default();
+        by_player
+            .entry(winner_id.clone())
+            .or_default()
+            .push(PeriodResult {
+                opponent_mu: loser_pre.mu,
+                opponent_phi: loser_pre.phi,
+                score: 1.0,
+            });
+        by_player
+            .entry(loser_id.clone())
+            .or_default()
+            .push(PeriodResult {
+                opponent_mu: winner_pre.mu,
+                opponent_phi: winner_pre.phi,
+                score: 0.0,
+            });
+    }
+
+    // Apply Glicko-2 to active players, RD-inflate inactives.
+    let mut updated_count = 0usize;
+    for (discord_id, mut rating) in pre_period.into_iter() {
+        let needs_write = if let Some(results) = by_player.get(&discord_id) {
+            glicko::update_player_with_results(&mut rating, results);
+            true
+        } else {
+            // Tighten phi inflation: only meaningful if any phi growth
+            // would occur. For a brand-new player at default phi=350,
+            // continued inflation is silly (already maximal-uncertainty),
+            // so cap inflation at 350. No-op for a player at exactly 350.
+            let before = rating.phi;
+            glicko::decay_inactive_player(&mut rating);
+            if rating.phi > 350.0 {
+                rating.phi = 350.0;
+            }
+            // Still write if RD changed measurably.
+            rating.phi != before
+        };
+        if needs_write {
+            conn.execute(
+                "UPDATE game_ratings SET mu=?1, phi=?2, sigma=?3, updated_at=?4
+                 WHERE discord_id=?5 AND game=?6",
+                params![rating.mu, rating.phi, rating.sigma, now, discord_id, game],
+            )?;
+            updated_count += 1;
+        }
+    }
+
+    // Mark pending matches as applied.
+    for (id, _, _) in &pending {
+        conn.execute(
+            "UPDATE matches SET applied_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+    }
+
+    Ok((pending.len(), updated_count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Db {
+        Db::open(":memory:").unwrap()
+    }
+
+    #[test]
+    fn games_keep_separate_ratings_and_records() {
+        let db = mem();
+        db.process_result("alice", "bob", 2, 0, "r1", "aaaa@cf53523").unwrap();
+        db.process_result("bob", "alice", 98, 77, "r2", "nbajam:bbbb@cf53523#1234")
+            .unwrap();
+        db.close_rating_period().unwrap();
+
+        let mk2 = db.get_leaderboard(10, "mk2").unwrap();
+        let jam = db.get_leaderboard(10, "nbajam").unwrap();
+        assert_eq!(mk2[0].discord_id, "alice");
+        assert_eq!(jam[0].discord_id, "bob");
+        assert_eq!((mk2[0].wins, mk2[0].losses), (1, 0));
+        assert_eq!((jam[0].wins, jam[0].losses), (1, 0));
+
+        // Alice won MK2 and lost NBA Jam: one rating went up, the other down.
+        assert!(db.get_rating("alice", "mk2").unwrap().mu > 1500.0);
+        assert!(db.get_rating("alice", "nbajam").unwrap().mu < 1500.0);
+
+        let hist = db.get_match_history("alice", 10, "nbajam").unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!((hist[0].our_score, hist[0].opponent_score), (77, 98));
+    }
+
+    #[test]
+    fn player_who_never_played_a_game_reads_as_unrated_there() {
+        let db = mem();
+        db.process_result("alice", "bob", 2, 1, "r1", "aaaa@x").unwrap();
+        let p = db.get_player("alice", "nbajam").unwrap().unwrap();
+        assert_eq!((p.wins, p.matches_played), (0, 0));
+        assert_eq!(p.rating, 1500.0);
+        assert!(db.get_player("nobody", "mk2").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_ratings_become_mk2_once() {
+        let path = std::env::temp_dir().join(format!(
+            "fp-stats-legacy-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            // A pre-multi-game database: ratings live on `players`.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE players (
+                    discord_id TEXT PRIMARY KEY, username TEXT NOT NULL DEFAULT '',
+                    mu REAL NOT NULL DEFAULT 1500.0, phi REAL NOT NULL DEFAULT 350.0,
+                    sigma REAL NOT NULL DEFAULT 0.06, wins INTEGER NOT NULL DEFAULT 0,
+                    losses INTEGER NOT NULL DEFAULT 0, draws INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT '');
+                 INSERT INTO players (discord_id, username, mu, wins, losses)
+                    VALUES ('vet', 'Veteran', 1720.0, 30, 4);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        let board = db.get_leaderboard(10, "mk2").unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!((board[0].rating, board[0].wins), (1720.0, 30));
+        assert!(db.get_leaderboard(10, "nbajam").unwrap().is_empty());
+
+        // A newcomer who only plays NBA Jam must not grow an MK2 row on the
+        // next boot's migration.
+        db.process_result("rookie", "vet", 80, 60, "r1", "nbajam:cc@x").unwrap();
+        drop(db);
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM game_ratings WHERE discord_id='rookie' AND game='mk2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
 }
